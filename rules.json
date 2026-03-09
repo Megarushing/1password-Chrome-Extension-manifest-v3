@@ -13,8 +13,8 @@
       }
     },
     "condition": {
-      "urlFilter": "*://*/*onepasswdfill=*",
+      "urlFilter": "onepasswdfill",
       "resourceTypes": ["main_frame"]
     }
   }
-] 
+]

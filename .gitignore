@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# IDEs / editors
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~

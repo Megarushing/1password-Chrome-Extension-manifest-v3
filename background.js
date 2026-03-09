@@ -1,315 +1,127 @@
 // 1Password Extension - Manifest V3 Service Worker
-// This service worker handles the core background functionality
+// Shims MV2 APIs so that global.min.js can run in a MV3 service worker.
 
-// Variables to track the current fill operation
-let currentTabId = null;
+console.log('[1Password MV3] Service worker starting...');
 
-// Initialize the extension when the service worker starts
-try {
-  chrome.runtime.onStartup.addListener(() => {
-    console.log('1Password extension starting up...');
-    initializeExtension();
-  });
-} catch (error) {
-  console.log('Error setting up onStartup listener:', error);
+// ---- 0. Dev helper: allow reload via external message ----
+chrome.runtime.onMessageExternal.addListener(function(msg, sender, sendResponse) {
+  if (msg && msg.type === '__1pw_reload__') {
+    sendResponse({ok: true});
+    chrome.runtime.reload();
+  }
+});
+chrome.runtime.onMessage.addListener(function(msg, sender, sendResponse) {
+  if (msg && msg.type === '__1pw_reload__') {
+    sendResponse({ok: true});
+    chrome.runtime.reload();
+    return;
+  }
+  if (msg && msg.type === '__1pw_ping__') {
+    sendResponse({alive: true, timestamp: Date.now()});
+    return;
+  }
+});
+
+// ---- 1. Service workers don't have 'window' ----
+if (typeof window === 'undefined') {
+  self.window = self;
 }
 
+// ---- 2. chrome.browserAction → chrome.action ----
 try {
-  chrome.runtime.onInstalled.addListener(() => {
-    console.log('1Password extension installed...');
-    initializeExtension();
-  });
-} catch (error) {
-  console.log('Error setting up onInstalled listener:', error);
+  if (typeof chrome.browserAction === 'undefined' && chrome.action) {
+    chrome.browserAction = chrome.action;
+  }
+} catch(e) {
+  console.error('[1Password MV3] browserAction shim error:', e);
 }
 
-// Also initialize immediately in case the service worker is already running
+// ---- 3. Completely replace webRequest.onBeforeRequest.addListener ----
+// MV3 does NOT support blocking webRequest at all. The 'blocking' option
+// throws even if we try to call the original without it in some cases.
+// The onepasswdfill redirect is handled by declarativeNetRequest rules instead.
+// We replace the entire addListener so global.min.js calls succeed silently.
 try {
-  console.log('1Password extension service worker loaded...');
-  initializeExtension();
-} catch (error) {
-  console.log('Error during immediate initialization:', error);
-}
-
-// Initialize extension functionality
-function initializeExtension() {
-  // Check if we're in a service worker context
-  if (typeof ServiceWorkerGlobalScope !== 'undefined' && self instanceof ServiceWorkerGlobalScope) {
-    console.log('Running in service worker context');
-  } else {
-    console.log('Not in service worker context');
-  }
-  // Set up action click handler
-  if (chrome.action && chrome.action.onClicked) {
-    chrome.action.onClicked.addListener((tab) => {
-      console.log('Action button clicked for tab:', tab.id);
-      handleActionClick(tab);
-    });
-  }
-
-  // Set up context menu
-  if (chrome.contextMenus) {
-    try {
-      chrome.contextMenus.removeAll(() => {
-        chrome.contextMenus.create({
-          id: '1password-context-menu',
-          title: '1Password',
-          contexts: ['all']
-        });
-      });
-      
-      // Set up context menu click handler
-      if (chrome.contextMenus.onClicked) {
-        chrome.contextMenus.onClicked.addListener((info, tab) => {
-          console.log('Context menu clicked');
-          handleContextMenuClick(info);
-        });
+  if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
+    // Stash original BEFORE replacing
+    var _origWrAddListener = chrome.webRequest.onBeforeRequest.addListener.bind(
+      chrome.webRequest.onBeforeRequest
+    );
+    chrome.webRequest.onBeforeRequest.addListener = function(callback, filter, optExtraInfoSpec) {
+      // Strip 'blocking' — register as observation-only listener
+      var safeSpec;
+      if (Array.isArray(optExtraInfoSpec)) {
+        safeSpec = optExtraInfoSpec.filter(function(s) { return s !== 'blocking'; });
+        if (safeSpec.length === 0) safeSpec = undefined;
       }
-    } catch (error) {
-      console.log('Error setting up context menu:', error);
-    }
-  }
-
-  // Set up tab update listener
-  if (chrome.tabs && chrome.tabs.onUpdated) {
-    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-      if (changeInfo.status === 'complete') {
-        handleTabComplete(tab);
-      }
-    });
-  }
-
-  // Set up message handling
-  if (chrome.runtime && chrome.runtime.onMessage) {
-    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      console.log('Message received:', message);
-      if (message && message.command) {
-        handleMessage(message, sender, sendResponse);
-        return true; // Keep the message channel open for async response
-      }
-    });
-  }
-
-  // Set up declarativeNetRequest debug listener (only available in debug mode)
-  try {
-    if (chrome.declarativeNetRequest && chrome.declarativeNetRequest.onRuleMatchedDebug) {
-      chrome.declarativeNetRequest.onRuleMatchedDebug.addListener(
-        function(info) {
-          console.log('Rule matched for URL:', info.request.url);
-          if (info.request.url.includes('onepasswdfill')) {
-            handleOnePasswordFill(info);
-          }
+      var wrappedCallback = function(details) {
+        try { callback(details); } catch(e) {}
+      };
+      try {
+        if (safeSpec) {
+          _origWrAddListener(wrappedCallback, filter, safeSpec);
+        } else {
+          _origWrAddListener(wrappedCallback, filter);
         }
-      );
-    }
-  } catch (error) {
-    console.log('DeclarativeNetRequest debug API not available:', error);
-  }
-
-  // Fallback: Set up webRequest listener for onepasswdfill URLs
-  try {
-    if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
-      chrome.webRequest.onBeforeRequest.addListener(
-        function(details) {
-          if (details.url.includes('onepasswdfill')) {
-            console.log('onepasswdfill URL detected via webRequest:', details.url);
-            handleOnePasswordFill({
-              request: {
-                url: details.url,
-                tabId: details.tabId
-              }
-            });
-          }
-        },
-        {urls: ['<all_urls>'], types: ['main_frame']},
-        ['requestBody']
-      );
-    }
-  } catch (error) {
-    console.log('WebRequest onBeforeRequest API not available:', error);
-  }
-
-  // Set up webRequest listener
-  try {
-    if (chrome.webRequest && chrome.webRequest.onCompleted) {
-      chrome.webRequest.onCompleted.addListener(
-        function(details) {
-          if (currentTabId && currentTabId === details.tabId) {
-            console.log('Fill completion detected for tab:', details.tabId);
-            handleFillCompletion(details);
-          }
-        },
-        {types: ['main_frame'], urls: ['<all_urls>']}
-      );
-    }
-  } catch (error) {
-    console.log('WebRequest API not available:', error);
-  }
-}
-
-// Handle onepasswdfill URL processing
-function handleOnePasswordFill(info) {
-  console.log('Processing onepasswdfill URL:', info.request.url);
-  
-  // Extract parameters from URL
-  const url = new URL(info.request.url);
-  const onepasswdfill = url.searchParams.get('onepasswdfill');
-  const onepasswdvault = url.searchParams.get('onepasswdvault');
-  
-  if (onepasswdfill) {
-    currentTabId = info.request.tabId;
-    
-    // Send message to content script to handle the fill
-    try {
-      if (chrome.tabs && chrome.tabs.sendMessage) {
-        chrome.tabs.sendMessage(info.request.tabId, {
-          name: 'handleOnePasswordFill',
-          message: {
-            onepasswdfill: onepasswdfill,
-            onepasswdvault: onepasswdvault,
-            url: info.request.url
-          }
-        }).catch(error => {
-          console.log('Could not send message to tab:', error);
-        });
+      } catch(e) {
+        // If it still fails, just swallow — declarativeNetRequest handles redirects
+        console.warn('[1Password MV3] webRequest.onBeforeRequest not available, using declarativeNetRequest instead');
       }
-    } catch (error) {
-      console.log('Error sending message to tab:', error);
-    }
+    };
   }
+} catch(e) {
+  console.warn('[1Password MV3] webRequest patch error (non-fatal):', e);
 }
 
-// Handle fill completion
-function handleFillCompletion(details) {
-  console.log('Fill completion for tab:', details.tabId);
-  currentTabId = null;
-}
+// ---- 4. Patch contextMenus.create ----
+// MV3 requires: (a) an 'id' parameter, (b) no 'onclick' property.
+// Also guard against duplicate ID errors on service worker restart.
+try {
+  if (chrome.contextMenus) {
+    var _origCtxCreate = chrome.contextMenus.create.bind(chrome.contextMenus);
+    var _onClickHandlers = {};
+    var _ctxIdCounter = 0;
 
-// Handle action click
-function handleActionClick(tab) {
-  console.log('Action button clicked for URL:', tab.url);
-  if (tab && tab.url) {
-    try {
-      if (chrome.tabs && chrome.tabs.sendMessage) {
-        chrome.tabs.sendMessage(tab.id, {
-          name: 'toolbarButtonClicked',
-          message: { url: tab.url }
-        }).catch(error => {
-          console.log('Could not send message to tab:', error);
-        });
+    chrome.contextMenus.create = function(createProperties, callback) {
+      var props = Object.assign({}, createProperties);
+
+      // MV3 requires an id
+      if (!props.id) {
+        props.id = '1password-ctx-' + (++_ctxIdCounter);
       }
-    } catch (error) {
-      console.log('Error sending message to tab:', error);
-    }
-  }
-}
 
-// Handle context menu click
-function handleContextMenuClick(info) {
-  console.log('Context menu clicked for URL:', info.pageUrl);
-  if (info.pageUrl) {
-    try {
-      if (chrome.tabs && chrome.tabs.sendMessage) {
-        chrome.tabs.sendMessage(info.tabId, {
-          name: 'contextMenuClicked',
-          message: { url: info.pageUrl }
-        }).catch(error => {
-          console.log('Could not send message to tab:', error);
-        });
+      // MV3 doesn't support onclick — move to onClicked listener
+      if (props.onclick) {
+        _onClickHandlers[props.id] = props.onclick;
+        delete props.onclick;
       }
-    } catch (error) {
-      console.log('Error sending message to tab:', error);
-    }
-  }
-}
 
-// Handle tab complete
-function handleTabComplete(tab) {
-  console.log('Tab completed loading:', tab.url);
-  if (tab.url === 'https://agilebits.com/browsers/welcome.html') {
-    try {
-      if (chrome.tabs && chrome.tabs.sendMessage) {
-        chrome.tabs.sendMessage(tab.id, {
-          name: 'welcomePageLoaded',
-          message: {}
-        }).catch(error => {
-          console.log('Could not send message to tab:', error);
-        });
+      try {
+        return _origCtxCreate(props, callback);
+      } catch(e) {
+        // Swallow duplicate id errors on SW restart
+        console.warn('[1Password MV3] contextMenus.create:', e.message || e);
       }
-    } catch (error) {
-      console.log('Error sending message to tab:', error);
-    }
-  } else if (tab.url === 'https://agilebits.com/browsers/auth.html') {
-    try {
-      if (chrome.tabs && chrome.tabs.sendMessage) {
-        chrome.tabs.sendMessage(tab.id, {
-          name: 'authPageLoaded',
-          message: {}
-        }).catch(error => {
-          console.log('Could not send message to tab:', error);
-        });
+    };
+
+    chrome.contextMenus.onClicked.addListener(function(info, tab) {
+      var handler = _onClickHandlers[info.menuItemId];
+      if (handler) {
+        handler(info, tab);
       }
-    } catch (error) {
-      console.log('Error sending message to tab:', error);
-    }
+    });
   }
+} catch(e) {
+  console.error('[1Password MV3] contextMenus patch error:', e);
 }
 
-// Handle messages from content scripts
-function handleMessage(message, sender, sendResponse) {
-  console.log('Handling message:', message.command);
-  
-  // Route messages to appropriate handlers
-  switch (message.command) {
-    case 'getPageDetails':
-      handleGetPageDetails(message.params, sender, sendResponse);
-      break;
-    case 'autosave':
-      handleAutosave(message.params, sender, sendResponse);
-      break;
-    case 'fillItem':
-      handleFillItem(message.params, sender, sendResponse);
-      break;
-    case 'hello':
-      handleHello(message.params, sender, sendResponse);
-      break;
-    default:
-      console.warn('Unknown command:', message.command);
-      sendResponse({ error: 'Unknown command' });
-  }
+// ---- 5. Import the original 1Password background logic ----
+try {
+  importScripts('ext/sjcl.js');
+  importScripts('global.min.js');
+  console.log('[1Password MV3] Successfully loaded global.min.js with native messaging');
+} catch (e) {
+  console.error('[1Password MV3] Failed to load scripts:', e);
 }
 
-// Message handlers
-function handleGetPageDetails(params, sender, sendResponse) {
-  console.log('Getting page details');
-  // This would typically involve page analysis
-  sendResponse({ success: true, pageDetails: {} });
-}
-
-function handleAutosave(params, sender, sendResponse) {
-  console.log('Handling autosave');
-  // This would typically involve saving login data
-  sendResponse({ success: true });
-}
-
-function handleFillItem(params, sender, sendResponse) {
-  console.log('Handling fill item');
-  // This would typically involve filling form fields
-  sendResponse({ success: true });
-}
-
-function handleHello(params, sender, sendResponse) {
-  console.log('Handling hello message');
-  sendResponse({ 
-    success: true, 
-    version: '4.7.5.90',
-    capabilities: {
-      declarativeNetRequest: true,
-      serviceWorker: true
-    }
-  });
-}
-
-// Initialize when the service worker loads
-console.log('1Password service worker loading...');
-initializeExtension(); 
+console.log('[1Password MV3] Service worker initialization complete');
